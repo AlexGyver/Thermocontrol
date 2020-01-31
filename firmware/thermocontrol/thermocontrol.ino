@@ -1,6 +1,6 @@
 /*
   Скетч к проекту "Терморегулятор"
-  - Страница проекта (схемы, описания):
+  - Страница проекта (схемы, описания): https://alexgyver.ru/thermocontrol/
   - Исходники на GitHub:
   Проблемы с загрузкой? Читай гайд для новичков: https://alexgyver.ru/arduino-first/
   Нравится, как написан код? Поддержи автора! https://alexgyver.ru/support_alex/
@@ -27,11 +27,15 @@
 
   Пин термистора/далласа:
   - A0 на Arduino (PC0 чип)
-  - P2 на Digispark (PB2 чип)
+  - A1 (P2) на Digispark (PB2 чип)
 
   Пин кнопки:
   - D2 на Arduino (PD2 чип)
   - P3 на Digispark (PB3 чип)
+
+  Пин пищалки:
+  - D4 на Arduino (PD2 чип)
+  - P0 на Digispark (PB0 чип)
 */
 
 // ========= ДАТЧИК ========
@@ -45,11 +49,11 @@
 // проводной 3950
 
 // ===== РЕЖИМ РАБОТЫ =====
-#define MIN_TEMP 25     // мин. температура
-#define MAX_TEMP 35     // макс. температура
+#define MIN_TEMP 30     // мин. температура
+#define MAX_TEMP 45     // макс. температура
 #define MIN_SPEED 30    // (0-255) мин скорость
 #define MAX_SPEED 255   // (0-255) макс скорость
-#define ALARM_TEMP 60   // температура тревоги
+#define ALARM_TEMP 50   // температура тревоги
 #define BUZZER_TYPE 0   // тип пищалки: 0 пассивный, 1 активный
 
 // ========= КНОПКА ========
@@ -61,7 +65,7 @@
 
 // ===== ДЛЯ РАЗРАБОТЧИКОВ =====
 // отладка
-#define DEBUG_ENABLE 1
+#define DEBUG_ENABLE 0
 #if (DEBUG_ENABLE == 1)
 #define DEBUG(x) Serial.println(x)
 #else
@@ -70,8 +74,9 @@
 
 // выбор пинов
 #if defined(__AVR_ATtiny85__)
+#pragma message ("tiny85")
 #define BTN_PIN PB3   // кнопка
-#define SENS_PIN PB2  // датчик
+#define SENS_PIN A1   // датчик
 #define OUT_PIN PB1   // выход
 #define BUZ_PIN PB0   // пищалка
 #else
@@ -83,7 +88,7 @@
 
 // либы
 #include "timerMinim.h"
-timerMinim fanTimer(50);
+timerMinim fanTimer(60);
 timerMinim sensorTimer(2000);
 
 #if (SENSOR_TYPE == 0)
@@ -111,6 +116,7 @@ int16_t minTemp = MIN_TEMP, maxTemp = MAX_TEMP;
 bool systemState = true;
 int newFanSpeed = 0;
 int currentTemp = 0;
+int fanSpeed = 0;
 uint32_t thisTime;
 bool buzFlag = false;
 bool alarmFlag = false;
@@ -122,21 +128,13 @@ void setup() {
 
 #if defined(__AVR_ATtiny85__)
   // инициализация ШИМ 20 кГц для tiny85
-  PLLCSR = (1 << PLLE);          // PLL enable
-  while (!PLLCSR & (1 << PLOCK)); // PLL locked
-  PLLCSR |= (1 << PCKE);         // Timer1 clock - 64MHz from PLL
-
-  TCCR1 = (1 << PWM1A) | (1 << COM1A1) | 0x05; // PWM A enable , pin connected to timer, prescaler - /16
-  OCR1C = 199;
-  pinMode(OUT_PIN, OUTPUT);
+  initPWM();
 #else
   // инициализация ШИМ 20 кГц для mega328
   TCCR2A = 0b10100011;
   TCCR2B = 0b00001010;
   OCR2A = 99;
-  pinMode(OUT_PIN, OUTPUT);
 #endif
-
   // пинаем далласа
 #if (SENSOR_TYPE == 1)
   dallas.requestTemp();
@@ -144,8 +142,8 @@ void setup() {
 
   // восстанавливаем настройки (если с кнопкой)
 #if (BTN_CONTROL == 1)
-  if (eeprom_read_byte(0) != 25) { // первый запуск
-    eeprom_write_byte(0, 25);
+  if (eeprom_read_byte(0) != 50) { // первый запуск
+    eeprom_write_byte(0, 50);
     EEPROM_UPD_INT(1, minTemp);
     EEPROM_UPD_INT(3, maxTemp);
   }
@@ -153,24 +151,14 @@ void setup() {
   maxTemp = (int)EEPROM_READ_INT(3);
 #endif
   pinMode(BUZ_PIN, OUTPUT);
+  pinMode(OUT_PIN, OUTPUT);
 }
 
 void loop() {
   tempToSpeed();
   fanTick();
   buttonTick();
-  buzzTick();
 }
-
-void buzzTick() {
-#if (BUZZER_TYPE == 0)
-  if (alarmFlag && micros() - thisTime >= 2500) {
-    thisTime = micros();
-    digitalWrite(BUZ_PIN, buzFlag);
-    buzFlag = !buzFlag;
-  }
-}
-#endif
 
 // преобразуем температуру в скорость
 void tempToSpeed() {
@@ -182,13 +170,23 @@ void tempToSpeed() {
     dallas.requestTemp();           // запросить измерение
 #endif
     // преобразовать диапазон и ограничить значение
-    newFanSpeed = map(currentTemp, minTemp, maxTemp, MIN_SPEED, MAX_SPEED);
-    newFanSpeed = constrain(newFanSpeed, MIN_SPEED, MAX_SPEED);    
+    if (!systemState) newFanSpeed = 0;          // если выкл - скорость 0
+    else {
+      newFanSpeed = map(currentTemp, minTemp, maxTemp, MIN_SPEED, MAX_SPEED);
+      newFanSpeed = constrain(newFanSpeed, MIN_SPEED, MAX_SPEED);
+    }
+
+#if defined(__AVR_ATtiny85__)
+    initPWM();
+#endif
     if (currentTemp > ALARM_TEMP) {
       alarmFlag = !alarmFlag;
+#if (BUZZER_TYPE == 0)
+      if (alarmFlag) tone(BUZ_PIN, 400, 900);
+#else
       digitalWrite(BUZ_PIN, alarmFlag);
+#endif
     } else {
-      alarmFlag = false;
       digitalWrite(BUZ_PIN, 0);
     }
     //DEBUG(currentTemp);
@@ -198,11 +196,9 @@ void tempToSpeed() {
 // плавный контроль вентилятора
 void fanTick() {
   if (fanTimer.isReady()) {
-    static int fanSpeed = 0;
-    if (!systemState) newFanSpeed = 0;          // если выкл - скорость 0
-    if (newFanSpeed > fanSpeed) fanSpeed += 1;  // плавно управляем
-    if (newFanSpeed < fanSpeed) fanSpeed -= 1;  // плавно управляем
-    if (systemState) fanSpeed = constrain(fanSpeed, 0, 255);  // ограничить
+    if (newFanSpeed > fanSpeed) fanSpeed += 2;  // плавно управляем
+    if (newFanSpeed < fanSpeed) fanSpeed -= 2;  // плавно управляем
+    fanSpeed = constrain(fanSpeed, 0, 255);  // ограничить
 #if defined(__AVR_ATtiny85__)
     tiny85_PWM20kHz(fanSpeed);    // ШИМ для тини
 #else
@@ -247,27 +243,31 @@ void buttonTick() {
 // пищатель
 void buzzer(byte count) {
   for (byte i = 0; i < count; i++) {
-    uint32_t thisTime = millis();
-    uint32_t buzTimer = micros();
-    digitalWrite(BUZ_PIN, 1);
-    while (millis() - thisTime < 200) {
 #if (BUZZER_TYPE == 0)
-      if (micros() - buzTimer >= 1000) {
-        buzTimer = micros();
-        digitalWrite(BUZ_PIN, buzFlag);
-        buzFlag = !buzFlag;
-      }
-#endif
-    }
+    tone(BUZ_PIN, 400, 200);
+    delay(200);
+#else
+    digitalWrite(BUZ_PIN, 1);
+    delay(200);
     digitalWrite(BUZ_PIN, 0);
+#endif
     delay(70);
   }
+#if defined(__AVR_ATtiny85__)
+  initPWM();
+#endif
 }
 
 // ШИМ 20 кГц
 #if defined(__AVR_ATtiny85__)
+void initPWM() {
+  // инициализация ШИМ 20 кГц для tiny85
+  TCCR0A = _BV(COM0B1) | _BV(WGM01) | _BV(WGM00);
+  TCCR0B = _BV(WGM02) | 0x02;
+  OCR0A = 99;
+}
 void tiny85_PWM20kHz(uint8_t duty) {
-  OCR1A = (float)duty * 0.78;
+  OCR0B = (float)duty * 0.39;
 }
 #else
 void mega328_PWM20kHz_D3(uint8_t duty) {
